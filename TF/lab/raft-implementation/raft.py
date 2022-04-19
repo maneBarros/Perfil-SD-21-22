@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import logging
 import threading
 import queue
 import random
@@ -7,160 +8,271 @@ from ms import *
 
 logging.getLogger().setLevel(logging.DEBUG)
 
+# Raft states
+FOLLOWER = 0; CANDIDATE = 1; LEADER = 2
 
-FOLLOWER  = 0
-CANDIDATE = 1
-LEADER    = 2
-timeoutRange = (150,300)
-pendingMessages = queue.Queue()
-timeoutValue = 0
+# Timeout range for follower/candidate timeout
+timeoutRange = (150,301) # 150 - 300 ms
 
 node_id = 0
 node_ids = []
+lock = threading.RLock()
+
 state = FOLLOWER
 currentTerm = 0
+log = []
+commitIndex = -1 # Highest index known to be commited (first log index is 0)
+store = {}
 
-# Data structures for candidate state
-votes = 0
-votingEvents = {}
-waitingLimit = 0
+# For follower state
+votedFor = None # Necessary, for example, when leaders revert to followers but don't vote for a leader (received an invalid request vote with higher term than the current one)
+heardFromLeader = False
 
-handlers_state = {
-    FOLLOWER  : handlers_follower,
-    CANDIDATE : handlers_candidate,
-    LEADER    : handlers_leader
-}
+# For candidate state
+votes = {}
+timeoutCond = threading.Condition(lock=lock)
 
-handlers_follower = {
-    'init' : handle_init
-}
+# For leader state
+peerInfo = {}
 
-timeout_handlers {
-    FOLLOWER : runForLeader
-}
+# Some helpful classes and functions
+class UnexpectedMessage(Exception):
+    pass
 
-def handle(msg):
+def majority():
+    return len(node_ids) // 2 + 1
+
+def random_timeout():
+    return random.randrange(*timeoutRange,10) / 1000
+
+def otherNodes():
+    return [id for id in node_ids if id != node_id]
+
+def reply11(msg):
+    reply(msg, type='error', code=11, text='Not a leader')
+
+def apply(msg):
+    global store
     type = msg.body.type
-    if type in handlers_state[state]:
-        handlers[state][type](msg)
-    else:
-        logging.warning(f'Not ready for messages of type {type} in the state {state}')
+    with lock:
+        if type == 'read':
+            return {'type':'read_ok', 'value':store[msg.body.key]} if msg.body.key in store else {'type':'error', 'code':20, 'text':'Key not in store'}
+        elif type == 'write':
+            store[msg.body.key] = msg.body.value
+            return {'type':'write_ok'}
+        elif type == 'cas':
+            if msg.body.key in store:
+                if store[msg.body.key] == msg.body.__dict__['from']:
+                    store[msg.body.key] = msg.body.to
+                    success = (True,)
+                else:
+                    success = (False, (22, 'Values don\'t match'))
+            else:
+                success = (False, (20, 'Key not in store'))
+            return {'type':'cas_ok'} if success[0] else {'type':'error', 'code':success[1][0], 'text':success[1][1]}
 
 def handle_init(msg):
     global node_id, node_ids
     node_id = msg.body.node_id
     node_ids = msg.body.node_ids
     reply(msg, type='init_ok')
-    timeoutValue = random_timeout()
+    becomeFollower()
 
-def random_timeout():
-    return random.randint(*timeoutRange)
+# ======================================================================================== #
+# --------------------------------------- FOLLOWER --------------------------------------- #
+# ======================================================================================== #
 
-def handle_read(msg):
-    pass
+def becomeFollower(msg=None):
+    global state, currentTerm, heardFromLeader
+    with lock:
+        state = FOLLOWER
+        if msg:
+            handler_follower(msg)
+    threading.Thread(target=waitForFollowerTimeout).start()
 
-def handle_write(msg):
-    pass
-
-def handle_cas(msg):
-    pass
-
-def send_AppendEntries(dst, **content):
-    pass
-
-def send_RequestVote(dst, **content):
-    pass
-
-
-def handle_msg(msg):
-    global pendingMessages
-    pendingMessages.put(msg)
-
-def followerLoop():
-    global pendingMessages, state
-    state = FOLLOWER
-    try:
-        while(True):
-            nextMsg = pendingMessages.get(block=True, timeout=randomtimeout)
-    except queue.Empty as e:
+def waitForFollowerTimeout():
+    global heardFromLeader
+    with timeoutCond:
+        while timeoutCond.wait_for(lambda : heardFromLeader, timeout=random_timeout()):
+            heardFromLeader = False
         # Timeout!
         runForLeader()
 
+def handler_follower(msg):
+    global currentTerm, heardFromLeader, votedFor
+    type = msg.body.type
+    with lock:
+        if type in ['read', 'write', 'cas']:
+            reply11(msg)
+        else:
+            if msg.body.term > currentTerm:
+                currentTerm = msg.body.term # Updates current term if incoming term is higher
+                votedFor = None
 
-def requestVote(noRequestNeeded):
-    sendRequest = True
-    while(sendRequest):
-        # send vote request
-        # wait for event for some time
+            if type == 'AppendEntries':
+                if msg.body.term < currentTerm:
+                    reply(msg, type='AppendEntriesReply', success=False, term=currentTerm)
+                else:
+                    heardFromLeader = True; timeoutCond.notify_all() # Heard from a leader: reset timeout clock
+                    handle_AppendEntries(msg)
+            elif type == 'RequestVote':
+                if msg.body.term < currentTerm or \
+                   votedFor != None and votedFor != msg.src or \
+                   (log[-1][0] if log else 0, len(log)-1) > (msg.body.lastLogTerm, msg.body.lastLogIndex):
+                    reply(msg, type='RequestVoteReply', term=currentTerm, granted=False)
+                else:
+                    heardFromLeader = True; timeoutCond.notify_all() # Heard from a valid candidate: reset timeout clock
+                    votedFor = msg.src
+                    reply(msg, type='RequestVoteReply', term=currentTerm, granted=True)
+            else:
+                raise UnexpectedMessage(f"Not ready for messages of type {type} in FOLLOWER state!\nMessage: {msg}")
 
-# When it times out, a follower becomes a candidate and attempts to become leader
+def handle_AppendEntries(msg):
+    global log, commitIndex
+    with lock:
+        if len(log) > msg.body.prevIndex and (msg.body.prevIndex < 0 or log[msg.body.prevIndex][0] == msg.body.prevTerm): # Success! Every log entry up until this index matches wiht leader
+            log = log[0:msg.body.prevIndex+1] + msg.body.entries
+            if msg.body.commitIndex > commitIndex:
+                lastApplied = commitIndex
+                commitIndex = min(msg.body.commitIndex, len(log)-1) # To allow more conservative implementations
+                applyLogEntries(lastApplied)
+            reply(msg, type='AppendEntriesReply', term=currentTerm, success=True, matchIndex=len(log)-1)
+        else:
+            reply(msg, type='AppendEntriesReply', term=currentTerm, success=False, matchIndex=0)
+
+def applyLogEntries(lastApplied):
+    with lock:
+        for (_,op) in log[lastApplied+1:commitIndex+1]:
+            apply(op)
+
+# ======================================================================================== #
+# --------------------------------------- CANDIDATE -------------------------------------- #
+# ======================================================================================== #
+
 def runForLeader():
-    global currentTerm, state, votes, votingEvents, timeoutValue, waitingLimit, electionState
+    global state, currentTerm, votes, votedFor
+    electedSomeone = False
+    with timeoutCond:
+        state = CANDIDATE
+        while not electedSomeone:
+            currentTerm += 1
+            myterm = currentTerm
+            votedFor = node_id
+            votes = {node_id : True}
+            requestVotes()
+            threading.Thread(target=retryRequestVote, args=(currentTerm,)).start()
+            electedSomeone = timeoutCond.wait_for(lambda: myterm != currentTerm or state != CANDIDATE, random_timeout())
 
-    #runningForLeader = True
-    currentTerm += 1
-    state = CANDIDATE
-    votes = 1
-    votingEvents = {}
-    electionState = 0 # 1 -> won the election; 2 -> another leader; 3 -> timeout
-    for peer in [id in node_ids if id != node_id]:
-        event = threading.Event()
-        votingEvents[peer] = event
-        threading.Thread(target=requestVote, args=(event,)).start()
+def retryRequestVote(myterm):
+    retransmitTimeout = 0.1 # 100 ms
+    with timeoutCond:
+        while not timeoutCond.wait_for(lambda : currentTerm != myterm or state != CANDIDATE, timeout=retransmitTimeout):
+            requestVotes()
 
-    waitingLimit = time.time() + random_timeout()
-    timeoutValue = waitingLimit - time.time()
+def requestVotes():
+    with lock:
+        for node in [node for node in otherNodes() if node not in votes]:
+            send(node_id, node, type='RequestVote', term=currentTerm, lastLogIndex=len(log)-1, lastLogTerm=log[-1][0] if log else 0)
 
+def handler_candidate(msg):
+    global votes
+    type = msg.body.type
+    with lock:
+        if type in ['read','write','cas']:
+            reply11(msg)
+        elif type == 'AppendEntries':
+            becomeFollower(msg) if msg.body.term >= currentTerm else reply(msg, type='AppendEntriesReply', term=currentTerm, success=False)
+        elif type == 'RequestVote':
+            becomeFollower(msg) if msg.body.term > currentTerm else reply(msg, type='RequestVoteReply', term=currentTerm, granted=False)
+        elif type == 'RequestVoteReply':
+            if msg.body.term > currentTerm:
+                becomeFollower(msg)
+            elif msg.body.term == currentTerm:
+                votes[msg.src] = msg.body.granted
+                if len([id for id in votes if votes[id]]) == majority():
+                    becomeLeader()
+        else:
+            raise UnexpectedMessage(f"Not ready for messages of type {type} in CANDIDATE state!\nMessage: {msg}")
 
-    while (electionState == 0):
-        try:
-            msg = pendingMessages.get(timeout=waitingLimit-time.time())
+# ======================================================================================== #
+# ---------------------------------------- LEADER ---------------------------------------- #
+# ======================================================================================== #
 
-            if msg.body.type == 'AppendEntries' and msg.body.term >= currentTerm:
-                electionState = 2
+def handler_leader(msg):
+    global log
+    type = msg.body.type
+    with lock:
+        if type in ['read','write','cas']:
+            log.append((currentTerm,msg))
+            for follower in peerInfo:
+                peerInfo[follower]['cond'].notify()
+        elif msg.body.term > currentTerm:
+            becomeFollower(msg)
+        elif type == 'AppendEntriesReply' and msg.body.term == currentTerm:
+            handle_AppendEntriesReply(msg)
+        elif type == 'RequestVotes':
+            reply(msg, type='RequestVotesReply', term=currentTerm, granted=False)
+        else:
+            raise UnexpectedMessage(f"Not ready for messages of type {type} in LEADER state!\nMessage: {msg}")
 
-            elif msg.body.type == 'RequestVote':
-                reply(msg, type='RequestVoteReply', granted=False)
+def handle_AppendEntriesReply(msg):
+    global peerInfo, commitIndex
+    with lock:
+        matchIndex = msg.body.matchIndex
+        if msg.body.success:
+            peerInfo[msg.src]['matchIndex'] = matchIndex
+            peerInfo[msg.src]['nextIndex'] = msg.body.matchIndex + 1
+            if matchIndex > commitIndex and \
+               log[matchIndex][0] == currentTerm and \
+               1 + len([p for p in peerInfo if peerInfo[p]['matchIndex'] >= matchIndex]) >= majority():
+                lastApplied = commitIndex
+                commitIndex = matchIndex
+                apply_and_reply(lastApplied)
+        else:
+            peerInfo[msg.src]['nextIndex'] -= 1
+        peerInfo[msg.src]['cond'].notify()
 
-            elif msg.body.type == 'RequestVoteReply':
-                votingEvents[msg.src].set() # Notify that we received a reply from this server
-                del votingEvents[msg.src]
-                if msg.body.granted:
-                    votes += 1
-                    if votes == len(node_ids) // 2 + 1:
-                        electionState = 1
-                        for peer in votingEvents:
-                            votingEvents[peer].set() # Notify that we dont need more answers
+# Create a thread for each peer in the network. These threads start "serving" the followers
+def becomeLeader():
+    global state, peerInfo
+    with lock:
+        state = LEADER
+        for id in otherNodes():
+            peerInfo[id] = {'cond' : threading.Condition(lock=lock), 'nextIndex' : len(log), 'matchIndex' : 0}
+            threading.Thread(target=serveFollower, args=(currentTerm,id,peerInfo[id])).start()
 
-            elif msg.body.type in ['read', 'write', 'cas']:
-                reply(msg, type='error', code=11, text='Not leader')
+def serveFollower(myterm,peer_id,peer):
+    timeoutValue = 0.08
+    with lock:
+        while myterm == currentTerm:
+            nextIndex = peer['nextIndex']
+            prevIndex = nextIndex - 1
+            prevTerm = log[prevIndex][0] if prevIndex >= 0 else 0
+            entries = log[nextIndex:len(log)]
+            send(node_id, peer_id, type='AppendEntries', term=currentTerm, prevIndex=prevIndex, prevTerm=prevTerm, entries=entries, commitIndex=commitIndex)
+            peer['cond'].wait_for(lambda : myterm != currentTerm or nextIndex != peer['nextIndex'] and len(log) > peer['nextIndex'], timeoutValue)
 
+def apply_and_reply(lastApplied):
+    with lock:
+        for (term,req) in log[lastApplied+1 : commitIndex+1]:
+            rep = apply(req)
+            if term == currentTerm:
+                reply(req,**rep)
 
-        except queue.Empty as e:
-            # Timeout! Let's try to run again for a new term
-            for peer in votingEvents:
-                votingEvents[peer].set() # stop threads waiting for answers
-                electionState = 3
+# Different message handlers for different states
+handlers_state = {
+    FOLLOWER  : handler_follower,
+    CANDIDATE : handler_candidate,
+    LEADER    : handler_leader
+}
 
-    if electionState == 1: # I won the election
-        becomeLeader()
-    elif electionState == 2: # Another leader
-        for peer in votingEvents:
-            votingEvents[peer].set() # stop threads waiting for answers
-            electionState = 3
-        followerLoop()
-
-
-
-def receiveMsgs():
-    for msg in receiveAll():
-        pendingMessages.put(msg)
+# Handle incoming messages
+def handle(msg):
+    try:
+        handle_init(msg) if msg.body.type == 'init' else handlers_state[state](msg)
+    except UnexpectedMessage as e:
+        logging.warning(e)
 
 if __name__ == '__main__':
-    threading.Thread(target=receiveMsgs).start()
-    while(True):
-        try:
-            msg = pendingMessages.get(timeout=timeoutValue)
-            handle(msg)
-        except queue.Empty as empty:
-            handle_timeout()
+    for msg in receiveAll():
+        handle(msg)
