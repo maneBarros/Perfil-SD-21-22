@@ -52,3 +52,4 @@ _checkouts/
 
 ### Erlang Patch ###
 rebar3.crashdump
+*.fressian

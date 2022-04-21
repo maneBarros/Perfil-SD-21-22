@@ -35,10 +35,7 @@ timeoutCond = threading.Condition(lock=lock)
 # For leader state
 peerInfo = {}
 
-# Some helpful classes and functions
-class UnexpectedMessage(Exception):
-    pass
-
+# Some helpful functions
 def majority():
     return len(node_ids) // 2 + 1
 
@@ -82,6 +79,8 @@ def handle_init(msg):
 # --------------------------------------- FOLLOWER --------------------------------------- #
 # ======================================================================================== #
 
+# Reverts to (or starts as) a follower
+# When reverting to follower from candidate/leader state, takes the message that triggered this change as input
 def becomeFollower(msg=None):
     global state, currentTerm, heardFromLeader
     with lock:
@@ -90,6 +89,7 @@ def becomeFollower(msg=None):
             handler_follower(msg)
     threading.Thread(target=waitForFollowerTimeout).start()
 
+# Function executed by background thread for triggering election process when timeout ocurrs
 def waitForFollowerTimeout():
     global heardFromLeader
     with timeoutCond:
@@ -98,6 +98,7 @@ def waitForFollowerTimeout():
         # Timeout!
         runForLeader()
 
+# How to handle incoming messages as follower
 def handler_follower(msg):
     global currentTerm, heardFromLeader, votedFor
     type = msg.body.type
@@ -124,8 +125,6 @@ def handler_follower(msg):
                     heardFromLeader = True; timeoutCond.notify_all() # Heard from a valid candidate: reset timeout clock
                     votedFor = msg.src
                     reply(msg, type='RequestVoteReply', term=currentTerm, granted=True)
-            else:
-                raise UnexpectedMessage(f"Not ready for messages of type {type} in FOLLOWER state!\nMessage: {msg}")
 
 def handle_AppendEntries(msg):
     global log, commitIndex
@@ -149,6 +148,7 @@ def applyLogEntries(lastApplied):
 # --------------------------------------- CANDIDATE -------------------------------------- #
 # ======================================================================================== #
 
+# Function executed when follower times out, after some time has passed without hearing from a leader or a valid candidate
 def runForLeader():
     global state, currentTerm, votes, votedFor
     electedSomeone = False
@@ -163,17 +163,21 @@ def runForLeader():
             threading.Thread(target=retryRequestVote, args=(currentTerm,)).start()
             electedSomeone = timeoutCond.wait_for(lambda: myterm != currentTerm or state != CANDIDATE, random_timeout())
 
+# Every 100ms, if election is still going, retry to request votes from peers who have not answered yet
+# Executed by a background thread after sending first round of RequestVotes
 def retryRequestVote(myterm):
     retransmitTimeout = 0.1 # 100 ms
     with timeoutCond:
         while not timeoutCond.wait_for(lambda : currentTerm != myterm or state != CANDIDATE, timeout=retransmitTimeout):
             requestVotes()
 
+# Sends request votes to all peers who haven't answered yet
 def requestVotes():
     with lock:
         for node in [node for node in otherNodes() if node not in votes]:
             send(node_id, node, type='RequestVote', term=currentTerm, lastLogIndex=len(log)-1, lastLogTerm=log[-1][0] if log else 0)
 
+# How to handle messages as candidate
 def handler_candidate(msg):
     global votes
     type = msg.body.type
@@ -191,13 +195,33 @@ def handler_candidate(msg):
                 votes[msg.src] = msg.body.granted
                 if len([id for id in votes if votes[id]]) == majority():
                     becomeLeader()
-        else:
-            raise UnexpectedMessage(f"Not ready for messages of type {type} in CANDIDATE state!\nMessage: {msg}")
 
 # ======================================================================================== #
 # ---------------------------------------- LEADER ---------------------------------------- #
 # ======================================================================================== #
 
+# Create a thread for each peer in the network. These threads start "serving" the followers
+def becomeLeader():
+    global state, peerInfo
+    with lock:
+        state = LEADER
+        for id in otherNodes():
+            peerInfo[id] = {'cond' : threading.Condition(lock=lock), 'nextIndex' : len(log), 'matchIndex' : 0}
+            threading.Thread(target=serveFollower, args=(currentTerm,id,peerInfo[id])).start()
+
+# Serve follower identified by peer_id: that is, send an AppendEntries to this follower whenever it is necessary
+def serveFollower(myterm,peer_id,peer):
+    timeoutValue = 0.08
+    with lock:
+        while myterm == currentTerm:
+            nextIndex = peer['nextIndex']
+            prevIndex = nextIndex - 1
+            prevTerm = log[prevIndex][0] if prevIndex >= 0 else 0
+            entries = log[nextIndex:len(log)]
+            send(node_id, peer_id, type='AppendEntries', term=currentTerm, prevIndex=prevIndex, prevTerm=prevTerm, entries=entries, commitIndex=commitIndex)
+            peer['cond'].wait_for(lambda : myterm != currentTerm or nextIndex != peer['nextIndex'] and len(log) > peer['nextIndex'], timeoutValue)
+
+# How to handle messages as leader
 def handler_leader(msg):
     global log
     type = msg.body.type
@@ -212,8 +236,6 @@ def handler_leader(msg):
             handle_AppendEntriesReply(msg)
         elif type == 'RequestVotes':
             reply(msg, type='RequestVotesReply', term=currentTerm, granted=False)
-        else:
-            raise UnexpectedMessage(f"Not ready for messages of type {type} in LEADER state!\nMessage: {msg}")
 
 def handle_AppendEntriesReply(msg):
     global peerInfo, commitIndex
@@ -232,26 +254,7 @@ def handle_AppendEntriesReply(msg):
             peerInfo[msg.src]['nextIndex'] -= 1
         peerInfo[msg.src]['cond'].notify()
 
-# Create a thread for each peer in the network. These threads start "serving" the followers
-def becomeLeader():
-    global state, peerInfo
-    with lock:
-        state = LEADER
-        for id in otherNodes():
-            peerInfo[id] = {'cond' : threading.Condition(lock=lock), 'nextIndex' : len(log), 'matchIndex' : 0}
-            threading.Thread(target=serveFollower, args=(currentTerm,id,peerInfo[id])).start()
-
-def serveFollower(myterm,peer_id,peer):
-    timeoutValue = 0.08
-    with lock:
-        while myterm == currentTerm:
-            nextIndex = peer['nextIndex']
-            prevIndex = nextIndex - 1
-            prevTerm = log[prevIndex][0] if prevIndex >= 0 else 0
-            entries = log[nextIndex:len(log)]
-            send(node_id, peer_id, type='AppendEntries', term=currentTerm, prevIndex=prevIndex, prevTerm=prevTerm, entries=entries, commitIndex=commitIndex)
-            peer['cond'].wait_for(lambda : myterm != currentTerm or nextIndex != peer['nextIndex'] and len(log) > peer['nextIndex'], timeoutValue)
-
+# Apply operations in log from lastApplied to current commitIndex. Replies to clients if the request was made during this leader's term
 def apply_and_reply(lastApplied):
     with lock:
         for (term,req) in log[lastApplied+1 : commitIndex+1]:
@@ -266,13 +269,6 @@ handlers_state = {
     LEADER    : handler_leader
 }
 
-# Handle incoming messages
-def handle(msg):
-    try:
-        handle_init(msg) if msg.body.type == 'init' else handlers_state[state](msg)
-    except UnexpectedMessage as e:
-        logging.warning(e)
-
 if __name__ == '__main__':
     for msg in receiveAll():
-        handle(msg)
+        handle_init(msg) if msg.body.type == 'init' else handlers_state[state](msg)
