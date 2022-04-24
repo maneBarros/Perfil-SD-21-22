@@ -1,9 +1,9 @@
 -module(priorityqueue_trees).
 -export([create/0, enqueue/3, dequeue/1]).
--import(gb_trees, [get/2, update/3, insert/3, iterator/1, next/1, is_defined/2]).
+-import(gb_trees, [get/2, update/3, insert/3, iterator/1, next/1, is_defined/2, empty/0]).
 
 create() ->
-  gb_trees:empty().
+  empty().
 
 enqueue(PriQueue, Item, Priority) ->
   case is_defined(Priority, PriQueue) of
