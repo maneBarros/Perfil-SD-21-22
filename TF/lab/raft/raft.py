@@ -40,7 +40,7 @@ def majority():
     return len(node_ids) // 2 + 1
 
 def random_timeout():
-    return random.randrange(*timeoutRange,10) / 1000
+    return random.randrange(*timeoutRange) / 1000
 
 def otherNodes():
     return [id for id in node_ids if id != node_id]
@@ -82,14 +82,14 @@ def handle_init(msg):
 # Reverts to (or starts as) a follower
 # When reverting to follower from candidate/leader state, takes the message that triggered this change as input
 def becomeFollower(msg=None):
-    global state, currentTerm, heardFromLeader
+    global state
     with lock:
         state = FOLLOWER
         if msg:
             handler_follower(msg)
     threading.Thread(target=waitForFollowerTimeout).start()
 
-# Function executed by background thread for triggering election process when timeout ocurrs
+# Function executed by background thread for triggering election process when timeout occurs
 def waitForFollowerTimeout():
     global heardFromLeader
     with timeoutCond:
@@ -219,7 +219,7 @@ def serveFollower(myterm,peer_id,peer):
             prevTerm = log[prevIndex][0] if prevIndex >= 0 else 0
             entries = log[nextIndex:len(log)]
             send(node_id, peer_id, type='AppendEntries', term=currentTerm, prevIndex=prevIndex, prevTerm=prevTerm, entries=entries, commitIndex=commitIndex)
-            peer['cond'].wait_for(lambda : myterm != currentTerm or nextIndex != peer['nextIndex'] and len(log) > peer['nextIndex'], timeoutValue)
+            peer['cond'].wait_for(lambda : nextIndex != peer['nextIndex'] and len(log) > peer['nextIndex'], timeoutValue)
 
 # How to handle messages as leader
 def handler_leader(msg):
@@ -244,11 +244,14 @@ def handle_AppendEntriesReply(msg):
         if msg.body.success:
             peerInfo[msg.src]['matchIndex'] = matchIndex
             peerInfo[msg.src]['nextIndex'] = matchIndex + 1
-            if matchIndex > commitIndex and \
-               log[matchIndex][0] == currentTerm and \
-               1 + len([p for p in peerInfo if peerInfo[p]['matchIndex'] >= matchIndex]) >= majority():
+            newCommitIndex = matchIndex # There is possibly a new commit index. Need to check indexes between commitIndex and the arriving matchIndex for new commit index!
+            while newCommitIndex > commitIndex and \
+                  log[newCommitIndex][0] == currentTerm and \
+                  1 + len([p for p in peerInfo if peerInfo[p]['matchIndex'] >= newCommitIndex]) < majority():
+                    newCommitIndex -= 1
+            if newCommitIndex > commitIndex and log[newCommitIndex][0] == currentTerm: # There is a new commit index!
                 lastApplied = commitIndex
-                commitIndex = matchIndex
+                commitIndex = newCommitIndex
                 apply_and_reply(lastApplied)
         else:
             peerInfo[msg.src]['nextIndex'] -= 1
